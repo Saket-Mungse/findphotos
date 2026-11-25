@@ -1,5 +1,4 @@
 import { useState } from 'react';
-import { FirebaseError } from 'firebase/app';
 import { useRouter } from 'expo-router';
 import {
   ActivityIndicator,
@@ -23,24 +22,10 @@ type FieldErrors = {
 };
 
 function getAuthErrorMessage(error: unknown) {
-  if (!(error instanceof FirebaseError)) {
-    return 'Something went wrong. Please try again.';
+  if (error instanceof Error) {
+    return error.message;
   }
-
-  switch (error.code) {
-    case 'auth/email-already-in-use':
-      return 'That email is already registered.';
-    case 'auth/invalid-email':
-      return 'Enter a valid email address.';
-    case 'auth/weak-password':
-      return 'Password must be at least 6 characters.';
-    case 'auth/invalid-credential':
-      return 'Invalid email or password.';
-    case 'auth/too-many-requests':
-      return 'Too many attempts. Try again in a few minutes.';
-    default:
-      return 'Authentication failed. Please try again.';
-  }
+  return 'Authentication failed. Please try again.';
 }
 
 export default function AuthScreen() {
@@ -113,17 +98,17 @@ export default function AuthScreen() {
           <Text style={styles.brand}>FindPhotos</Text>
           <Text style={styles.title}>{isRegisterMode ? 'Create Account' : 'Welcome Back'}</Text>
           <Text style={styles.subtitle}>
-            {isRegisterMode ? 'Register to sync and find your event photos.' : 'Login to continue.'}
+            {isRegisterMode ? 'Register to manage events and find photos.' : 'Sign in to your account.'}
           </Text>
 
           <View style={styles.card}>
             {isRegisterMode ? (
               <View style={styles.fieldBlock}>
-                <Text style={styles.label}>Name</Text>
+                <Text style={styles.label}>Full Name</Text>
                 <TextInput
                   autoCapitalize="words"
                   onChangeText={setName}
-                  placeholder="Your name"
+                  placeholder="e.g. Rahul Sharma"
                   placeholderTextColor={COLORS.textMuted}
                   style={styles.input}
                   value={name}
@@ -133,7 +118,7 @@ export default function AuthScreen() {
             ) : null}
 
             <View style={styles.fieldBlock}>
-              <Text style={styles.label}>Email</Text>
+              <Text style={styles.label}>Email Address</Text>
               <TextInput
                 autoCapitalize="none"
                 autoComplete="email"
@@ -173,7 +158,7 @@ export default function AuthScreen() {
 
             <Pressable onPress={toggleMode} style={styles.modeButton}>
               <Text style={styles.modeButtonText}>
-                {isRegisterMode ? 'Already have an account? Login' : `Need an account? Register`}
+                {isRegisterMode ? 'Already have an account? Sign in' : `Don't have an account? Register`}
               </Text>
             </Pressable>
           </View>
@@ -194,7 +179,7 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     width: '100%',
-    maxWidth: 480,
+    maxWidth: 460,
     alignSelf: 'center',
     justifyContent: 'center',
     padding: 24,
@@ -222,8 +207,8 @@ const styles = StyleSheet.create({
     borderColor: COLORS.border,
     borderWidth: 1,
     borderRadius: 16,
-    padding: 18,
-    gap: 14,
+    padding: 20,
+    gap: 16,
   },
   fieldBlock: {
     gap: 6,
@@ -254,15 +239,16 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.accent,
     minHeight: 46,
     paddingHorizontal: 16,
+    marginTop: 4,
   },
   primaryButtonText: {
-    color: COLORS.text,
+    color: '#fff',
     fontSize: 15,
     fontWeight: '700',
   },
   modeButton: {
     alignItems: 'center',
-    paddingVertical: 4,
+    paddingVertical: 8,
   },
   modeButtonText: {
     color: COLORS.textMuted,

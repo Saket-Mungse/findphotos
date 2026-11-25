@@ -43,9 +43,15 @@ frontend/android
 
 # Backend (Python)
 backend/venv/
+backend/.venv/
+backend/qdrant_storage/
+service_account.json
+backend/service_account.json
 backend/__pycache__/
 backend/*.pyc
 backend/config.json
 backend/*.jpeg
 backend/*.jpg
 backend/*.png
+backend/findphotos.db
+backend/photo_cache/

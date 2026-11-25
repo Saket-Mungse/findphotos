@@ -1,11 +1,10 @@
-import { useRef, useState } from 'react';
+import { useRef, useState, useEffect } from 'react';
 import { Ionicons } from '@expo/vector-icons';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import {
   ActivityIndicator,
   FlatList,
   Image,
-  Linking,
   Modal,
   Platform,
   Pressable,
@@ -16,30 +15,37 @@ import {
   useWindowDimensions,
 } from 'react-native';
 import { useLocalSearchParams } from 'expo-router';
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 
 import { COLORS } from '@/constants/theme';
-import { identifyFace, photoProxyUrl, downloadPhotosZip, type PhotoMatch } from '@/lib/api';
+import { identifyFace, photoProxyUrl, downloadPhotosZip, apiGetEventInfo, type PhotoMatch } from '@/lib/api';
 
 export default function AttendeeScreen() {
   const { event } = useLocalSearchParams<{ event?: string }>();
   const [manualEventId, setManualEventId] = useState('');
-  
-  const activeEventId = event || manualEventId;
-  const [tempEventId, setTempEventId] = useState('');
+  const [eventName, setEventName] = useState('');
+  const [tempCodeInput, setTempCodeInput] = useState('');
 
+  // Active event ID is either from QR/URL query param or manual input
+  const activeEventId = event || manualEventId;
+
+  // Camera & Upload state
   const cameraRef = useRef<CameraView | null>(null);
   const [permission, requestPermission] = useCameraPermissions();
   const { width } = useWindowDimensions();
 
+  // QR Scanner modal state
+  const [qrScannerVisible, setQrScannerVisible] = useState(false);
+
+  // Selfie capture state
   const [cameraVisible, setCameraVisible] = useState(false);
   const [previewVisible, setPreviewVisible] = useState(false);
   const [capturedUri, setCapturedUri] = useState<string | null>(null);
   const [showResults, setShowResults] = useState(false);
   const [cameraError, setCameraError] = useState('');
 
-  // API state
+  // API Face Search state
   const [isSearching, setIsSearching] = useState(false);
   const [matches, setMatches] = useState<PhotoMatch[]>([]);
   const [facesDetected, setFacesDetected] = useState(0);
@@ -54,17 +60,60 @@ export default function AttendeeScreen() {
 
   const itemSize = Math.min(180, Math.max(90, (width - 64) / 3));
 
+  // Automatically fetch event info whenever activeEventId changes
+  useEffect(() => {
+    if (activeEventId) {
+      apiGetEventInfo(activeEventId).then(info => {
+        setEventName(info.name);
+      }).catch(() => {
+        setEventName(activeEventId);
+      });
+    } else {
+      setEventName('');
+    }
+  }, [activeEventId]);
+
+  // ── QR Scanner Handler ─────────────────────────────────────────────────────
+
+  const openQrScanner = async () => {
+    if (Platform.OS === 'web') {
+      alert('To scan with a mobile phone, open your phone camera and point it at the event QR code.');
+      return;
+    }
+    const currentPermission = permission?.granted ? permission : await requestPermission();
+    if (!currentPermission.granted) {
+      alert('Camera permission is required to scan the event QR code.');
+      return;
+    }
+    setQrScannerVisible(true);
+  };
+
+  const handleBarcodeScanned = ({ data }: { data: string }) => {
+    let extractedId = data.trim();
+    if (extractedId.includes('event=')) {
+      try {
+        const match = extractedId.match(/event=([^&]+)/);
+        if (match) extractedId = decodeURIComponent(match[1]);
+      } catch {}
+    }
+    setQrScannerVisible(false);
+    if (extractedId) {
+      setManualEventId(extractedId);
+      resetSearch();
+    }
+  };
+
+  // ── Camera / File Upload for Selfie ────────────────────────────────────────
+
   const openCamera = async () => {
     setCameraError('');
 
     if (Platform.OS === 'web') {
-      // On web, use file picker instead of camera
       triggerFilePicker();
       return;
     }
 
     const currentPermission = permission?.granted ? permission : await requestPermission();
-
     if (!currentPermission.granted) {
       setCameraError('Camera permission is required to capture a selfie.');
       return;
@@ -76,7 +125,6 @@ export default function AttendeeScreen() {
   const triggerFilePicker = () => {
     if (Platform.OS !== 'web') return;
 
-    // Create or reuse a hidden file input
     if (!fileInputRef.current) {
       const input = document.createElement('input');
       input.type = 'file';
@@ -101,9 +149,7 @@ export default function AttendeeScreen() {
   };
 
   const capturePhoto = async () => {
-    if (!cameraRef.current) {
-      return;
-    }
+    if (!cameraRef.current) return;
 
     try {
       const photo = await cameraRef.current.takePictureAsync({
@@ -126,6 +172,8 @@ export default function AttendeeScreen() {
     setSearchError('');
     await openCamera();
   };
+
+  // ── Face Search ───────────────────────────────────────────────────────────
 
   const runSearch = async () => {
     if (!capturedUri || !activeEventId) return;
@@ -158,19 +206,16 @@ export default function AttendeeScreen() {
     setFacesDetected(0);
   };
 
+  // ── Download Helpers ──────────────────────────────────────────────────────
+
   const downloadPhoto = async (photo: PhotoMatch) => {
     setIsDownloading(true);
     try {
       const url = photoProxyUrl(photo.drive_file_id);
-      // Fallback filename if backend doesn't provide one
       const rawFilename = photo.filename || `photo_${photo.drive_file_id}.jpg`;
-      // Ensure the filename is safe for the filesystem (no spaces or weird characters)
       const safeFilename = rawFilename.replace(/[^a-zA-Z0-9.\-_]/g, '_');
 
       if (Platform.OS === 'web') {
-        // Append a query param to bypass the browser's disk cache.
-        // If the browser cached the image via the <img> tag (no-cors opaque response),
-        // reusing it for fetch() causes a CORS 'Failed to fetch' error.
         const res = await fetch(`${url}?download=1`, { cache: 'no-store' });
         if (!res.ok) throw new Error(`Server returned HTTP ${res.status}`);
         const blob = await res.blob();
@@ -180,8 +225,12 @@ export default function AttendeeScreen() {
         a.download = safeFilename;
         document.body.appendChild(a);
         a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(blobUrl);
+        setTimeout(() => {
+          try {
+            document.body.removeChild(a);
+            URL.revokeObjectURL(blobUrl);
+          } catch (_) {}
+        }, 2000);
       } else {
         const fileUri = FileSystem.documentDirectory + safeFilename;
         const downloaded = await FileSystem.downloadAsync(url, fileUri);
@@ -195,7 +244,6 @@ export default function AttendeeScreen() {
         }
       }
     } catch (err) {
-      console.error('Download error:', err);
       const msg = err instanceof Error ? err.message : String(err);
       alert(`Failed to download photo: ${msg}`);
     } finally {
@@ -204,7 +252,7 @@ export default function AttendeeScreen() {
   };
 
   const handleDownloadZip = async () => {
-    if (matches.length === 0) return;
+    if (matches.length === 0 || !activeEventId) return;
     setIsDownloading(true);
     try {
       const blob = await downloadPhotosZip(
@@ -218,13 +266,14 @@ export default function AttendeeScreen() {
         a.download = `${activeEventId}_photos.zip`;
         document.body.appendChild(a);
         a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(blobUrl);
+        setTimeout(() => {
+          try {
+            document.body.removeChild(a);
+            URL.revokeObjectURL(blobUrl);
+          } catch (_) {}
+        }, 2000);
       } else {
         const fileUri = FileSystem.documentDirectory + `${activeEventId}_photos.zip`;
-        // expo-file-system cannot save a Blob directly from fetch. 
-        // We have to read it as base64 or download directly from a URL.
-        // But since we already have a Blob on native, we must convert it to base64.
         const reader = new FileReader();
         reader.onloadend = async () => {
           const base64data = (reader.result as string).split(',')[1];
@@ -238,7 +287,6 @@ export default function AttendeeScreen() {
         reader.readAsDataURL(blob);
       }
     } catch (err) {
-      console.error('Zip download error:', err);
       const msg = err instanceof Error ? err.message : String(err);
       alert(`Failed to download zip: ${msg}`);
     } finally {
@@ -262,64 +310,132 @@ export default function AttendeeScreen() {
     </Pressable>
   );
 
+  // ── 1. If No Event Selected (Attendee opened manually without scan/link) ───
+
   if (!activeEventId) {
     return (
-      <View style={[styles.screen, { justifyContent: 'center', padding: 20 }]}>
+      <View style={[styles.screen, styles.centerScreen]}>
         <View style={styles.promptCard}>
-          <Text style={styles.promptTitle}>Enter Event Code</Text>
-          <Text style={styles.promptText}>To find your photos, you need the event code from the organizer.</Text>
-          <TextInput
-            style={[styles.input, { marginVertical: 16 }]}
-            placeholder="e.g. aarav_wedding"
-            placeholderTextColor={COLORS.textMuted}
-            value={tempEventId}
-            onChangeText={setTempEventId}
-            autoCapitalize="none"
-          />
-          <Pressable 
-            style={[styles.actionButton, !tempEventId.trim() && { opacity: 0.5 }]} 
-            onPress={() => { if (tempEventId.trim()) setManualEventId(tempEventId.trim()); }}
+          <View style={styles.promptIcon}>
+            <Ionicons name="qr-code-outline" size={32} color={COLORS.accent} />
+          </View>
+          <Text style={styles.promptTitle}>Join Event Album</Text>
+          <Text style={styles.promptText}>
+            Scan the event QR code or enter the event code from the organizer to find your photos.
+          </Text>
+
+          {/* Option A: In-app QR Scanner */}
+          {Platform.OS !== 'web' && (
+            <Pressable onPress={openQrScanner} style={styles.scanQrBtn}>
+              <Ionicons name="scan-outline" size={20} color="#fff" />
+              <Text style={styles.scanQrBtnText}>Scan Event QR Code</Text>
+            </Pressable>
+          )}
+
+          {/* Option B: Manual Event Code Entry */}
+          <View style={styles.fieldBlock}>
+            <Text style={styles.fieldLabel}>Event Code</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="e.g. rohit_wedding_8f21"
+              placeholderTextColor={COLORS.textMuted}
+              value={tempCodeInput}
+              onChangeText={setTempCodeInput}
+              autoCapitalize="none"
+            />
+          </View>
+
+          <Pressable
+            disabled={!tempCodeInput.trim()}
+            style={[styles.actionButton, !tempCodeInput.trim() && { opacity: 0.5 }]}
+            onPress={() => {
+              if (tempCodeInput.trim()) {
+                setManualEventId(tempCodeInput.trim());
+              }
+            }}
           >
-            <Text style={styles.actionButtonText}>Join Event</Text>
+            <Text style={styles.actionButtonText}>Proceed to Event</Text>
           </Pressable>
         </View>
+
+        {/* QR Scanner Modal (for mobile native) */}
+        <Modal
+          animationType="slide"
+          onRequestClose={() => setQrScannerVisible(false)}
+          visible={qrScannerVisible}
+        >
+          <View style={styles.cameraScreen}>
+            <CameraView
+              barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
+              onBarcodeScanned={handleBarcodeScanned}
+              style={StyleSheet.absoluteFill}
+            />
+            <View style={styles.qrScanOverlay}>
+              <View style={styles.qrTargetBox} />
+              <Text style={styles.qrTargetHint}>Point camera at the event QR code</Text>
+            </View>
+            <Pressable
+              onPress={() => setQrScannerVisible(false)}
+              style={styles.closeScannerBtn}
+            >
+              <Ionicons name="close" size={26} color="#fff" />
+            </Pressable>
+          </View>
+        </Modal>
       </View>
     );
   }
 
+  // ── 2. Direct Attendee Event Screen (No Login, No Password Required!) ──────
+
   return (
     <View style={styles.screen}>
+      
+      {/* Top Event Header */}
+      <View style={styles.eventTopHeader}>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.eventTopName}>{eventName || activeEventId}</Text>
+          <Text style={styles.eventTopId}>Code: {activeEventId}</Text>
+        </View>
+        <Pressable onPress={() => { setManualEventId(''); resetSearch(); }} style={styles.switchEventBtn}>
+          <Ionicons name="refresh-outline" size={15} color={COLORS.textMuted} />
+          <Text style={styles.switchEventBtnText}>Change Event</Text>
+        </Pressable>
+      </View>
+
       {!showResults ? (
+        /* Direct Selfie Upload Screen */
         <View style={styles.centerContainer}>
-          <Text style={styles.title}>Find Your Event Photos</Text>
+          <Text style={styles.title}>Find Your Photos</Text>
           <Text style={styles.subtitle}>
-            Upload a selfie, and we'll instantly find all photos of you from the event <Text style={{fontWeight: '700'}}>'{activeEventId}'</Text>.
+            Upload a selfie, and our AI will instantly find all photos from <Text style={{ color: COLORS.text, fontWeight: '700' }}>{eventName || activeEventId}</Text> that you appear in.
           </Text>
+
           <Pressable onPress={openCamera} style={styles.captureButton}>
             <Ionicons
-              color={COLORS.text}
+              color="#fff"
               name={Platform.OS === 'web' ? 'cloud-upload' : 'camera'}
-              size={26}
+              size={38}
             />
             <Text style={styles.captureText}>
-              {Platform.OS === 'web' ? 'Upload' : 'Capture'}
+              {Platform.OS === 'web' ? 'Upload Selfie' : 'Take Selfie'}
             </Text>
           </Pressable>
+
           <Text style={styles.captureHint}>
-            {Platform.OS === 'web'
-              ? 'Upload a selfie to find your photos'
-              : 'Take a selfie to find your photos'}
+            Upload a clear face photo • Your photos will be retrieved in seconds
           </Text>
           {cameraError ? <Text style={styles.errorText}>{cameraError}</Text> : null}
         </View>
       ) : (
+        /* Results View */
         <View style={styles.resultsContainer}>
           <View style={styles.resultsHeader}>
             <View style={{ flex: 1 }}>
-              <Text style={styles.resultsTitle}>Found {matches.length} Photos</Text>
+              <Text style={styles.resultsTitle}>Found {matches.length} Photos of You</Text>
               <Text style={styles.resultsSubtitle}>
-                {facesDetected > 1 ? 'Multiple faces detected. ' : ''}
-                Sorted by similarity match.
+                {facesDetected > 1 ? 'Multiple faces detected in selfie. ' : ''}
+                Matched photos sorted by similarity.
               </Text>
             </View>
             <View style={styles.headerActions}>
@@ -330,11 +446,11 @@ export default function AttendeeScreen() {
                   style={styles.zipButton}
                 >
                   {isDownloading ? (
-                    <ActivityIndicator color={COLORS.text} size="small" />
+                    <ActivityIndicator color="#fff" size="small" />
                   ) : (
-                    <Ionicons color={COLORS.text} name="download-outline" size={16} />
+                    <Ionicons color="#fff" name="download" size={16} />
                   )}
-                  <Text style={styles.zipButtonText}>ZIP</Text>
+                  <Text style={styles.zipButtonText}>Download All (ZIP)</Text>
                 </Pressable>
               )}
               <Pressable onPress={resetSearch} style={styles.resetButton}>
@@ -346,11 +462,11 @@ export default function AttendeeScreen() {
           {isSearching ? (
             <View style={styles.searchingContainer}>
               <ActivityIndicator color={COLORS.accent} size="large" />
-              <Text style={styles.searchingText}>Searching for your face…</Text>
+              <Text style={styles.searchingText}>Finding your photos…</Text>
             </View>
           ) : searchError ? (
             <View style={styles.errorContainer}>
-              <Ionicons color={COLORS.error} name="alert-circle-outline" size={32} />
+              <Ionicons color={COLORS.error} name="alert-circle-outline" size={36} />
               <Text style={styles.errorTitle}>Search Failed</Text>
               <Text style={styles.errorDetail}>{searchError}</Text>
               <Pressable onPress={openCamera} style={styles.retryButton}>
@@ -360,11 +476,11 @@ export default function AttendeeScreen() {
           ) : matches.length === 0 ? (
             <View style={styles.emptyContainer}>
               <Ionicons color={COLORS.textMuted} name="images-outline" size={48} />
-              <Text style={styles.emptyTitle}>No Matches Found</Text>
+              <Text style={styles.emptyTitle}>No Matching Photos Found</Text>
               <Text style={styles.emptyText}>
                 {facesDetected === 0
-                  ? 'No face was detected in your photo. Try a clearer selfie.'
-                  : 'Your face was detected but no matching photos were found in the event album.'}
+                  ? 'No face was detected in your selfie. Please try a clearer photo.'
+                  : 'Your face was detected, but no matching photos were found in this event.'}
               </Text>
               <Pressable onPress={openCamera} style={styles.retryButton}>
                 <Text style={styles.retryText}>Try Another Photo</Text>
@@ -390,7 +506,7 @@ export default function AttendeeScreen() {
           <CameraView facing="front" ref={cameraRef} style={StyleSheet.absoluteFill} />
           <View style={styles.cameraFooter}>
             <Pressable onPress={() => setCameraVisible(false)} style={styles.cameraSecondaryAction}>
-              <Ionicons color={COLORS.text} name="close" size={20} />
+              <Ionicons color="#fff" name="close" size={20} />
             </Pressable>
             <Pressable onPress={capturePhoto} style={styles.shutterOuter}>
               <View style={styles.shutterInner} />
@@ -400,11 +516,11 @@ export default function AttendeeScreen() {
         </View>
       </Modal>
 
-      {/* Preview Modal */}
+      {/* Preview Modal before Searching */}
       <Modal animationType="fade" onRequestClose={() => setPreviewVisible(false)} transparent visible={previewVisible}>
         <View style={styles.previewBackdrop}>
           <View style={styles.previewCard}>
-            <Text style={styles.previewTitle}>Preview</Text>
+            <Text style={styles.previewTitle}>Confirm Selfie</Text>
             {capturedUri ? <Image source={{ uri: capturedUri }} style={styles.previewImage} /> : null}
 
             <View style={styles.previewActions}>
@@ -413,7 +529,7 @@ export default function AttendeeScreen() {
               </Pressable>
               <Pressable onPress={runSearch} style={styles.previewPrimaryButton}>
                 {isSearching ? (
-                  <ActivityIndicator color={COLORS.text} size="small" />
+                  <ActivityIndicator color="#fff" size="small" />
                 ) : (
                   <Text style={styles.previewPrimaryText}>Find My Photos</Text>
                 )}
@@ -423,12 +539,12 @@ export default function AttendeeScreen() {
         </View>
       </Modal>
 
-      {/* Photo Viewer Modal */}
+      {/* Full Photo Viewer Modal */}
       <Modal animationType="fade" onRequestClose={() => setSelectedPhoto(null)} transparent visible={!!selectedPhoto}>
         <View style={styles.viewerBackdrop}>
           <View style={styles.viewerHeader}>
             <Pressable onPress={() => setSelectedPhoto(null)} style={styles.viewerCloseButton}>
-              <Ionicons color={COLORS.text} name="close" size={28} />
+              <Ionicons color="#fff" name="close" size={28} />
             </Pressable>
           </View>
           {selectedPhoto && (
@@ -445,11 +561,11 @@ export default function AttendeeScreen() {
               style={styles.downloadButton}
             >
               {isDownloading ? (
-                <ActivityIndicator color={COLORS.text} size="small" />
+                <ActivityIndicator color="#fff" size="small" />
               ) : (
                 <>
-                  <Ionicons color={COLORS.text} name="download-outline" size={20} />
-                  <Text style={styles.downloadButtonText}>Download</Text>
+                  <Ionicons color="#fff" name="download-outline" size={20} />
+                  <Text style={styles.downloadButtonText}>Download Photo</Text>
                 </>
               )}
             </Pressable>
@@ -465,30 +581,207 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: COLORS.background,
   },
+  centerScreen: {
+    justifyContent: 'center',
+    padding: 20,
+  },
+
+  // Gate Card (only if opened with no QR code/link)
+  promptCard: {
+    backgroundColor: COLORS.surface,
+    borderColor: COLORS.border,
+    borderWidth: 1,
+    borderRadius: 20,
+    padding: 24,
+    gap: 14,
+    maxWidth: 440,
+    width: '100%',
+    alignSelf: 'center',
+  },
+  promptIcon: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: 'rgba(108,92,231,0.12)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    alignSelf: 'center',
+    marginBottom: 4,
+  },
+  promptTitle: {
+    color: COLORS.text,
+    fontSize: 22,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+  promptText: {
+    color: COLORS.textMuted,
+    fontSize: 13,
+    lineHeight: 20,
+    textAlign: 'center',
+  },
+  scanQrBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: COLORS.accent,
+    paddingVertical: 14,
+    borderRadius: 12,
+    marginTop: 4,
+  },
+  scanQrBtnText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  fieldBlock: {
+    gap: 6,
+    marginTop: 4,
+  },
+  fieldLabel: {
+    color: COLORS.text,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  input: {
+    backgroundColor: COLORS.surfaceSoft,
+    borderColor: COLORS.border,
+    borderWidth: 1,
+    borderRadius: 12,
+    color: COLORS.text,
+    fontSize: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  actionButton: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.surfaceSoft,
+    borderColor: COLORS.accent,
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingVertical: 14,
+    marginTop: 4,
+  },
+  actionButtonText: {
+    color: COLORS.accent,
+    fontSize: 15,
+    fontWeight: '700',
+  },
+
+  // QR Scanner Screen Overlay
+  qrScanOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  qrTargetBox: {
+    width: 240,
+    height: 240,
+    borderWidth: 2,
+    borderColor: COLORS.accent,
+    borderRadius: 16,
+    backgroundColor: 'rgba(255,255,255,0.05)',
+  },
+  qrTargetHint: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+    marginTop: 16,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 10,
+  },
+  closeScannerBtn: {
+    position: 'absolute',
+    top: 40,
+    right: 20,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    borderRadius: 20,
+    padding: 8,
+  },
+
+  // Top Bar on Active Event
+  eventTopHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 18,
+    paddingVertical: 14,
+    backgroundColor: COLORS.surface,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.border,
+  },
+  eventTopName: {
+    color: COLORS.text,
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  eventTopId: {
+    color: COLORS.textMuted,
+    fontSize: 12,
+    marginTop: 2,
+  },
+  switchEventBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: COLORS.surfaceSoft,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 10,
+  },
+  switchEventBtnText: {
+    color: COLORS.textMuted,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+
+  // Center Selfie Prompt
   centerContainer: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 20,
-    gap: 14,
+    paddingHorizontal: 24,
+    gap: 16,
+  },
+  title: {
+    color: COLORS.text,
+    fontSize: 26,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+  subtitle: {
+    color: COLORS.textMuted,
+    fontSize: 14,
+    lineHeight: 22,
+    textAlign: 'center',
+    maxWidth: 400,
   },
   captureButton: {
     alignItems: 'center',
     justifyContent: 'center',
-    width: 180,
-    height: 180,
-    borderRadius: 90,
+    width: 170,
+    height: 170,
+    borderRadius: 85,
     backgroundColor: COLORS.accent,
-    gap: 8,
+    gap: 10,
+    shadowColor: COLORS.accent,
+    shadowOpacity: 0.35,
+    shadowRadius: 18,
+    elevation: 8,
+    marginVertical: 10,
   },
   captureText: {
-    color: COLORS.text,
-    fontSize: 24,
+    color: '#fff',
+    fontSize: 18,
     fontWeight: '800',
   },
   captureHint: {
     color: COLORS.textMuted,
-    fontSize: 14,
+    fontSize: 12,
     textAlign: 'center',
   },
   errorText: {
@@ -496,27 +789,27 @@ const styles = StyleSheet.create({
     fontSize: 13,
     textAlign: 'center',
   },
+
   // Results
   resultsContainer: {
     flex: 1,
-    paddingTop: 18,
-    paddingHorizontal: 14,
+    paddingTop: 16,
+    paddingHorizontal: 16,
   },
   resultsHeader: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    marginBottom: 14,
-    paddingHorizontal: 4,
+    marginBottom: 16,
   },
   resultsTitle: {
     color: COLORS.text,
-    fontSize: 24,
+    fontSize: 22,
     fontWeight: '800',
   },
   resultsSubtitle: {
     color: COLORS.textMuted,
-    fontSize: 13,
+    fontSize: 12,
     marginTop: 2,
   },
   headerActions: {
@@ -527,49 +820,36 @@ const styles = StyleSheet.create({
   zipButton: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
-    gap: 4,
-    height: 40,
-    paddingHorizontal: 12,
-    borderRadius: 20,
+    gap: 6,
     backgroundColor: COLORS.accent,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 12,
   },
   zipButtonText: {
-    color: COLORS.text,
-    fontSize: 13,
+    color: '#fff',
+    fontSize: 12,
     fontWeight: '700',
-  },
-  captureIconButton: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: COLORS.accent,
   },
   resetButton: {
     alignItems: 'center',
     justifyContent: 'center',
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 38,
+    height: 38,
+    borderRadius: 19,
     backgroundColor: COLORS.surfaceSoft,
-    borderColor: COLORS.border,
-    borderWidth: 1,
   },
-  // Searching state
   searchingContainer: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 16,
+    gap: 14,
   },
   searchingText: {
     color: COLORS.textMuted,
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '600',
   },
-  // Error state
   errorContainer: {
     flex: 1,
     alignItems: 'center',
@@ -579,27 +859,26 @@ const styles = StyleSheet.create({
   },
   errorTitle: {
     color: COLORS.text,
-    fontSize: 20,
+    fontSize: 18,
     fontWeight: '700',
   },
   errorDetail: {
     color: COLORS.textMuted,
-    fontSize: 14,
+    fontSize: 13,
     textAlign: 'center',
   },
   retryButton: {
     backgroundColor: COLORS.accent,
     borderRadius: 12,
-    paddingHorizontal: 24,
-    paddingVertical: 12,
+    paddingHorizontal: 22,
+    paddingVertical: 10,
     marginTop: 8,
   },
   retryText: {
-    color: COLORS.text,
+    color: '#fff',
     fontSize: 14,
     fontWeight: '700',
   },
-  // Empty state
   emptyContainer: {
     flex: 1,
     alignItems: 'center',
@@ -609,27 +888,28 @@ const styles = StyleSheet.create({
   },
   emptyTitle: {
     color: COLORS.text,
-    fontSize: 20,
+    fontSize: 18,
     fontWeight: '700',
   },
   emptyText: {
     color: COLORS.textMuted,
-    fontSize: 14,
+    fontSize: 13,
     textAlign: 'center',
     lineHeight: 20,
+    maxWidth: 320,
   },
-  // Grid
   gridContent: {
     paddingBottom: 24,
   },
   gridRow: {
-    justifyContent: 'space-between',
-    marginBottom: 10,
+    gap: 8,
+    marginBottom: 8,
   },
   photoCard: {
     borderRadius: 12,
     overflow: 'hidden',
     backgroundColor: COLORS.surfaceSoft,
+    position: 'relative',
   },
   photoImage: {
     width: '100%',
@@ -639,17 +919,18 @@ const styles = StyleSheet.create({
     position: 'absolute',
     bottom: 6,
     right: 6,
-    backgroundColor: 'rgba(13,15,26,0.75)',
+    backgroundColor: 'rgba(0,0,0,0.7)',
     borderRadius: 6,
     paddingHorizontal: 6,
     paddingVertical: 2,
   },
   scoreText: {
-    color: COLORS.text,
-    fontSize: 11,
+    color: '#fff',
+    fontSize: 10,
     fontWeight: '700',
   },
-  // Camera
+
+  // Native Camera
   cameraScreen: {
     flex: 1,
     backgroundColor: '#000',
@@ -662,7 +943,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 28,
     paddingBottom: 36,
     paddingTop: 16,
-    backgroundColor: 'rgba(0, 0, 0, 0.2)',
+    backgroundColor: 'rgba(0,0,0,0.3)',
   },
   cameraSecondaryAction: {
     alignItems: 'center',
@@ -670,169 +951,122 @@ const styles = StyleSheet.create({
     width: 42,
     height: 42,
     borderRadius: 21,
-    backgroundColor: 'rgba(16,16,16,0.6)',
+    backgroundColor: 'rgba(255,255,255,0.2)',
   },
   cameraSecondarySpacer: {
     width: 42,
-    height: 42,
   },
   shutterOuter: {
-    width: 82,
-    height: 82,
-    borderRadius: 41,
+    width: 76,
+    height: 76,
+    borderRadius: 38,
     borderWidth: 4,
-    borderColor: '#FFFFFF',
+    borderColor: '#fff',
     alignItems: 'center',
     justifyContent: 'center',
   },
   shutterInner: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
-    backgroundColor: '#FFFFFF',
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: '#fff',
   },
-  // Preview
+
+  // Preview Modal
   previewBackdrop: {
     flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.85)',
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: 'rgba(6,8,16,0.84)',
     padding: 20,
   },
   previewCard: {
-    width: '100%',
-    maxWidth: 420,
     backgroundColor: COLORS.surface,
-    borderRadius: 16,
-    borderWidth: 1,
     borderColor: COLORS.border,
-    padding: 14,
-    gap: 12,
+    borderWidth: 1,
+    borderRadius: 20,
+    padding: 20,
+    width: '100%',
+    maxWidth: 380,
+    alignItems: 'center',
+    gap: 14,
   },
   previewTitle: {
     color: COLORS.text,
     fontSize: 18,
-    fontWeight: '700',
-  },
-  previewImage: {
-    width: '100%',
-    aspectRatio: 1,
-    borderRadius: 12,
-    backgroundColor: '#111',
-  },
-  // Event Prompt
-  promptCard: {
-    backgroundColor: COLORS.surface,
-    borderColor: COLORS.border,
-    borderWidth: 1,
-    borderRadius: 18,
-    padding: 24,
-    gap: 8,
-  },
-  promptTitle: {
-    color: COLORS.text,
-    fontSize: 24,
     fontWeight: '800',
   },
-  promptText: {
-    color: COLORS.textMuted,
-    fontSize: 15,
-  },
-  input: {
-    backgroundColor: COLORS.surfaceSoft,
-    borderColor: COLORS.border,
-    borderWidth: 1,
-    borderRadius: 12,
-    color: COLORS.text,
-    fontSize: 16,
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-  },
-  actionButton: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: COLORS.accent,
-    borderRadius: 12,
-    minHeight: 48,
-  },
-  actionButtonText: {
-    color: COLORS.text,
-    fontSize: 16,
-    fontWeight: '700',
+  previewImage: {
+    width: 220,
+    height: 220,
+    borderRadius: 16,
   },
   previewActions: {
     flexDirection: 'row',
     gap: 10,
+    width: '100%',
   },
   previewSecondaryButton: {
     flex: 1,
-    minHeight: 44,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: COLORS.border,
     alignItems: 'center',
     justifyContent: 'center',
+    paddingVertical: 12,
+    borderRadius: 12,
+    backgroundColor: COLORS.surfaceSoft,
   },
   previewSecondaryText: {
-    color: COLORS.text,
+    color: COLORS.textMuted,
     fontSize: 14,
     fontWeight: '600',
   },
   previewPrimaryButton: {
-    flex: 1.4,
-    minHeight: 44,
-    borderRadius: 12,
-    backgroundColor: COLORS.accent,
+    flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
+    paddingVertical: 12,
+    borderRadius: 12,
+    backgroundColor: COLORS.accent,
   },
   previewPrimaryText: {
-    color: COLORS.text,
+    color: '#fff',
     fontSize: 14,
     fontWeight: '700',
   },
-  // Viewer
+
+  // Full Photo Viewer
   viewerBackdrop: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.95)',
+    backgroundColor: 'rgba(0,0,0,0.92)',
     justifyContent: 'space-between',
+    padding: 16,
   },
   viewerHeader: {
-    paddingTop: 50,
-    paddingHorizontal: 20,
     alignItems: 'flex-end',
+    paddingTop: 16,
   },
   viewerCloseButton: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    backgroundColor: 'rgba(255,255,255,0.1)',
-    alignItems: 'center',
-    justifyContent: 'center',
+    padding: 6,
   },
   viewerImage: {
-    flex: 1,
     width: '100%',
+    height: '75%',
   },
   viewerFooter: {
-    padding: 30,
-    paddingBottom: 50,
+    paddingBottom: 24,
     alignItems: 'center',
   },
   downloadButton: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
     gap: 8,
     backgroundColor: COLORS.accent,
-    paddingHorizontal: 32,
-    paddingVertical: 16,
-    borderRadius: 24,
-    minWidth: 180,
+    paddingHorizontal: 24,
+    paddingVertical: 14,
+    borderRadius: 14,
   },
   downloadButtonText: {
-    color: COLORS.text,
-    fontSize: 16,
+    color: '#fff',
+    fontSize: 15,
     fontWeight: '700',
   },
 });

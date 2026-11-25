@@ -36,8 +36,21 @@ function RootLayoutNav() {
     }
 
     const firstSegment = segments[0];
-    const inProtectedRoute = firstSegment === '(tabs)' || firstSegment === 'profile';
-    const inAuthRoute = !firstSegment || firstSegment === 'index';
+    const isAttendeeRoute = (segments as string[]).includes('attendee');
+    const inProtectedRoute = ((firstSegment === '(tabs)' && !isAttendeeRoute) || firstSegment === 'profile');
+    const inAuthRoute = !firstSegment || (firstSegment as string) === 'index';
+
+    // If user arrived via an event link or QR code with ?event=, immediately send to attendee screen
+    if (typeof window !== 'undefined' && window.location?.search) {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const eventParam = params.get('event');
+        if (eventParam && !isAttendeeRoute) {
+          router.replace(`/(tabs)/attendee?event=${encodeURIComponent(eventParam)}`);
+          return;
+        }
+      } catch {}
+    }
 
     if (!user && inProtectedRoute) {
       router.replace('/');
@@ -77,13 +90,12 @@ function RootLayoutNav() {
         screenOptions={{
           headerStyle: { backgroundColor: COLORS.surface },
           headerTintColor: COLORS.text,
-          headerShadowVisible: false,
+          headerTitleStyle: { fontWeight: '700' },
           contentStyle: { backgroundColor: COLORS.background },
         }}>
         <Stack.Screen name="index" options={{ headerShown: false }} />
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
         <Stack.Screen name="profile" options={{ title: 'Profile' }} />
-        <Stack.Screen name="+not-found" options={{ title: 'Not Found' }} />
       </Stack>
     </ThemeProvider>
   );

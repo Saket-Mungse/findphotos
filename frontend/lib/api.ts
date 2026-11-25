@@ -92,19 +92,23 @@ export async function checkHealth(): Promise<HealthResponse> {
   return res.json();
 }
 
-/** How many face vectors are currently indexed in Qdrant. */
+/** How many face vectors are currently indexed in Qdrant for this event. */
 export async function getStats(eventId?: string): Promise<StatsResponse> {
-  const url = eventId ? `${API_URL}/stats?event_id=${eventId}` : `${API_URL}/stats`;
+  if (!eventId) {
+    return { total_vectors: 0, collection: 'faces' };
+  }
+  const url = `${API_URL}/stats?event_id=${encodeURIComponent(eventId)}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Stats failed: ${res.status}`);
   return res.json();
 }
 
-/** Paginated list of unique photos from Qdrant (deduped by drive_file_id). */
+/** Paginated list of unique photos from Qdrant for a specific event. */
 export async function getPhotos(page = 0, perPage = 24, eventId?: string): Promise<PhotosResponse> {
-  const url = eventId 
-    ? `${API_URL}/photos?page=${page}&per_page=${perPage}&event_id=${eventId}`
-    : `${API_URL}/photos?page=${page}&per_page=${perPage}`;
+  if (!eventId) {
+    return { total: 0, page: 0, per_page: perPage, photos: [] };
+  }
+  const url = `${API_URL}/photos?page=${page}&per_page=${perPage}&event_id=${encodeURIComponent(eventId)}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Photos failed: ${res.status}`);
   return res.json();
@@ -150,12 +154,10 @@ export async function identifyFace(imageUri: string, eventId?: string): Promise<
   const formData = new FormData();
 
   if (Platform.OS === 'web') {
-    // On web: imageUri is either a blob URL or a data URI
     const response = await fetch(imageUri);
     const blob = await response.blob();
     formData.append('file', blob, 'selfie.jpg');
   } else {
-    // On native: pass the file URI directly
     formData.append('file', {
       uri: imageUri,
       type: 'image/jpeg',
@@ -163,11 +165,10 @@ export async function identifyFace(imageUri: string, eventId?: string): Promise<
     } as unknown as Blob);
   }
 
-  const url = eventId ? `${API_URL}/identify?event_id=${eventId}` : `${API_URL}/identify`;
+  const url = eventId ? `${API_URL}/identify?event_id=${encodeURIComponent(eventId)}` : `${API_URL}/identify`;
   const res = await fetch(url, {
     method: 'POST',
     body: formData,
-    // Don't set Content-Type — fetch sets it with the boundary automatically
   });
 
   if (!res.ok) {
@@ -229,4 +230,112 @@ export async function deletePhoto(fileId: string): Promise<{ status: string }> {
     throw new Error(err.detail ?? `Delete photo failed: ${res.status}`);
   }
   return res.json();
+}
+
+// ── Database / Auth Endpoints ────────────────────────────────────────────────
+
+export type DbUser = {
+  id: number;
+  name: string;
+  email: string;
+};
+
+export type DbEvent = {
+  id: number;
+  event_id: string;
+  photographer_id: number;
+  name: string;
+  event_password?: string;
+  drive_folder_id?: string;
+  created_at?: string;
+};
+
+export async function apiRegister(name: string, email: string, password: string): Promise<DbUser> {
+  const res = await fetch(`${API_URL}/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, email, password }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Registration failed' }));
+    throw new Error(err.detail ?? `Registration failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function apiLogin(email: string, password: string): Promise<DbUser> {
+  const res = await fetch(`${API_URL}/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Login failed' }));
+    throw new Error(err.detail ?? `Login failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function apiSaveEvent(
+  photographerId: number,
+  name: string,
+  eventPassword?: string,
+  driveLink?: string,
+  eventId?: string
+): Promise<DbEvent> {
+  const res = await fetch(`${API_URL}/db/events`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      photographer_id: photographerId,
+      name,
+      event_password: eventPassword || '',
+      drive_link: driveLink || '',
+      event_id: eventId || '',
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Failed to save event' }));
+    throw new Error(err.detail ?? `Failed to save event: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function apiGetEvents(photographerId: number): Promise<DbEvent[]> {
+  const res = await fetch(`${API_URL}/db/events?photographer_id=${photographerId}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Failed to fetch events' }));
+    throw new Error(err.detail ?? `Failed to fetch events: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function apiVerifyEvent(
+  eventIdentifier: string,
+  eventPassword: string
+): Promise<{ valid: boolean; event_id: string; name: string }> {
+  const res = await fetch(`${API_URL}/events/verify`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      event_identifier: eventIdentifier.trim(),
+      event_password: eventPassword.trim(),
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Invalid event credentials' }));
+    throw new Error(err.detail ?? 'Invalid event name or password.');
+  }
+  return res.json();
+}
+
+
+export async function apiGetEventInfo(eventId: string): Promise<{ event_id: string; name: string }> {
+  try {
+    const res = await fetch(`${API_URL}/events/info?event_id=${encodeURIComponent(eventId)}`);
+    if (res.ok) {
+      return res.json();
+    }
+  } catch {}
+  return { event_id: eventId, name: eventId };
 }

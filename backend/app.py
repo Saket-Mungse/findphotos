@@ -48,6 +48,14 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from insightface.app import FaceAnalysis
+from database import (
+    init_db,
+    register_photographer,
+    authenticate_photographer,
+    create_event_record,
+    get_photographer_events,
+    verify_event_access,
+)
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, FieldCondition, Filter, MatchAny, PointStruct, VectorParams
 
@@ -110,6 +118,9 @@ state = AppState()
 
 from collections import OrderedDict as _OD
 
+PHOTO_CACHE_DIR = Path(__file__).resolve().parent / "photo_cache"
+PHOTO_CACHE_DIR.mkdir(exist_ok=True)
+
 _PHOTO_CACHE_MAX = int(os.environ.get("PHOTO_CACHE_MAX", "200"))
 _photo_cache: _OD[str, bytes] = _OD()
 _photo_cache_lock = threading.Lock()
@@ -123,7 +134,36 @@ def _get_photo_bytes(file_id: str) -> bytes:
             _photo_cache.move_to_end(file_id)
             return _photo_cache[file_id]
 
-    raw = _download_drive_file(file_id)  # network call — outside the lock
+    disk_file = PHOTO_CACHE_DIR / f"{file_id}.img"
+    if disk_file.exists():
+        try:
+            raw = disk_file.read_bytes()
+            with _photo_cache_lock:
+                if len(_photo_cache) >= _PHOTO_CACHE_MAX:
+                    _photo_cache.popitem(last=False)
+                _photo_cache[file_id] = raw
+            return raw
+        except Exception:
+            pass
+
+    import time
+    last_err = None
+    raw = None
+    for attempt in range(3):
+        try:
+            raw = _download_drive_file(file_id)
+            try:
+                disk_file.write_bytes(raw)
+            except Exception:
+                pass
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(0.3 * (attempt + 1))
+
+    if raw is None:
+        logger.error(f"Error fetching photo {file_id}: {last_err}")
+        raise last_err or HTTPException(status_code=500, detail="Failed to fetch image")
 
     with _photo_cache_lock:
         if file_id not in _photo_cache:
@@ -139,7 +179,7 @@ _thread_local = threading.local()
 
 def _get_thread_drive_service():
     """Return (or lazily create) a Drive service for the calling thread."""
-    if not hasattr(_thread_local, "service"):
+    if not hasattr(_thread_local, "service") or _thread_local.service is None:
         _thread_local.service = _build_drive_service(GOOGLE_SA_JSON)
     return _thread_local.service
 
@@ -148,6 +188,8 @@ def _get_thread_drive_service():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    init_db()
+    logger.info("Database tables initialized ✅")
     state.config = load_config()
     logger.info(f"Loaded config: {state.config}")
 
@@ -157,13 +199,26 @@ async def lifespan(app: FastAPI):
     logger.info("InsightFace ready ✅")
 
     try:
-        state.qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+        if QDRANT_URL.lower() in ("local", "embedded", ":memory:") or not QDRANT_URL:
+            db_path = str(Path(__file__).resolve().parent / "qdrant_storage")
+            state.qdrant = QdrantClient(path=db_path)
+            logger.info(f"Qdrant running in embedded local mode at {db_path} ✅")
+        else:
+            state.qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=3.0)
+            state.qdrant.get_collections()
+            logger.info(f"Qdrant server connected at {QDRANT_URL} ✅")
         _ensure_collection(state.qdrant)
         logger.info("Qdrant ready ✅")
     except Exception as e:
-        logger.warning(f"Qdrant connection failed on startup (will retry on first request): {e}")
+        logger.warning(f"Qdrant connection to '{QDRANT_URL}' failed ({e}). Falling back to local embedded storage.")
+        db_path = str(Path(__file__).resolve().parent / "qdrant_storage")
+        state.qdrant = QdrantClient(path=db_path)
+        _ensure_collection(state.qdrant)
+        logger.info(f"Embedded Qdrant ready at {db_path} ✅")
 
-    if GOOGLE_SA_JSON:
+    sa_local = Path(__file__).resolve().parent / "service_account.json"
+    sa_root = Path(__file__).resolve().parent.parent / "service_account.json"
+    if GOOGLE_SA_JSON or sa_local.exists() or sa_root.exists():
         state.drive_service = _build_drive_service(GOOGLE_SA_JSON)
         logger.info("Google Drive service ready ✅")
     else:
@@ -195,7 +250,25 @@ app.add_middleware(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _build_drive_service(sa_json_str: str):
-    info = json.loads(sa_json_str)
+    info = None
+    if sa_json_str and os.path.isfile(sa_json_str):
+        with open(sa_json_str, "r", encoding="utf-8") as f:
+            info = json.load(f)
+    elif sa_json_str and sa_json_str.strip().startswith("{"):
+        info = json.loads(sa_json_str)
+    else:
+        sa_file = Path(__file__).resolve().parent / "service_account.json"
+        sa_file_root = Path(__file__).resolve().parent.parent / "service_account.json"
+        if sa_file.exists():
+            with open(sa_file, "r", encoding="utf-8") as f:
+                info = json.load(f)
+        elif sa_file_root.exists():
+            with open(sa_file_root, "r", encoding="utf-8") as f:
+                info = json.load(f)
+        elif sa_json_str:
+            info = json.loads(sa_json_str)
+    if not info:
+        raise ValueError("No service account credentials found")
     creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
     return build("drive", "v3", credentials=creds)
 
@@ -301,7 +374,7 @@ def _upsert_faces_batch(pairs: list[tuple]):
 
 
 def _list_drive_images(folder_id: str, subfolder: str = "") -> list[dict]:
-    svc = _get_thread_drive_service() if GOOGLE_SA_JSON else state.drive_service
+    svc = _get_thread_drive_service()
     results, page_token = [], None
     while True:
         resp = svc.files().list(
@@ -323,7 +396,7 @@ def _list_drive_images(folder_id: str, subfolder: str = "") -> list[dict]:
 
 def _download_drive_file(file_id: str) -> bytes:
     # Use a per-thread service so concurrent workers don't share httplib2 state
-    svc = _get_thread_drive_service() if GOOGLE_SA_JSON else state.drive_service
+    svc = _get_thread_drive_service()
     request = svc.files().get_media(fileId=file_id)
     buf = io.BytesIO()
     downloader = MediaIoBaseDownload(buf, request)
@@ -594,23 +667,17 @@ async def identify(
 
 @app.get("/stats")
 def stats(event_id: Optional[str] = Query(default=None)):
-    """Return how many faces and unique photos are currently indexed in Qdrant."""
-    if not state.qdrant:
-        return {"total_vectors": 0, "unique_photos": 0, "collection": QDRANT_COLLECTION}
+    """Return how many faces and unique photos are currently indexed in Qdrant for a specific event."""
+    if not state.qdrant or not event_id:
+        return {"total_vectors": 0, "collection": QDRANT_COLLECTION}
     try:
-        if event_id:
-            count = state.qdrant.count(
-                collection_name=QDRANT_COLLECTION,
-                count_filter=Filter(must=[FieldCondition(key="event_id", match=MatchAny(any=[event_id]))]),
-                exact=True,
-            )
-            total = count.count
-        else:
-            info = state.qdrant.get_collection(QDRANT_COLLECTION)
-            total = info.vectors_count or 0
-            
+        count = state.qdrant.count(
+            collection_name=QDRANT_COLLECTION,
+            count_filter=Filter(must=[FieldCondition(key="event_id", match=MatchAny(any=[event_id]))]),
+            exact=True,
+        )
         return {
-            "total_vectors": total,
+            "total_vectors": count.count,
             "collection": QDRANT_COLLECTION,
         }
     except Exception as e:
@@ -624,15 +691,14 @@ def list_photos(
     event_id: Optional[str] = Query(default=None)
 ):
     """
-    Return paginated list of unique photos indexed in Qdrant.
+    Return paginated list of unique photos indexed in Qdrant for a specific event.
     Deduplicates by drive_file_id so each photo appears once even if it has multiple faces.
+    Requires event_id to prevent leaking photos across events/users.
     """
-    if not state.qdrant:
+    if not state.qdrant or not event_id:
         return {"total": 0, "page": page, "per_page": per_page, "photos": []}
 
-    event_filter = None
-    if event_id:
-        event_filter = Filter(must=[FieldCondition(key="event_id", match=MatchAny(any=[event_id]))])
+    event_filter = Filter(must=[FieldCondition(key="event_id", match=MatchAny(any=[event_id]))])
 
     seen: dict[str, dict] = {}
     next_offset = None
@@ -688,7 +754,41 @@ def download_zip(payload: ZipDownloadRequest):
     zip_buffer = io.BytesIO()
     seen_names = set()
 
+    def _fetch_item(item):
+        try:
+            raw = _get_photo_bytes(item.drive_file_id)
+            name = item.filename.strip() if item.filename else f"photo_{item.drive_file_id[:8]}.jpg"
+            if not os.path.splitext(name)[1]:
+                name = f"{name}.jpg"
+            return (item.drive_file_id, name, raw)
+        except Exception as e:
+            logger.error(f"Failed to fetch photo {item.drive_file_id} for ZIP: {e}")
+            return None
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        fetched = list(pool.map(_fetch_item, payload.photos))
+
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for res in fetched:
+            if not res:
+                continue
+            fid, name, raw = res
+            if name in seen_names:
+                base, ext = os.path.splitext(name)
+                name = f"{base}_{fid[:6]}{ext}"
+            seen_names.add(name)
+            zf.writestr(name, raw)
+
+    zip_bytes = zip_buffer.getvalue()
+    headers = {
+        "Content-Disposition": 'attachment; filename="event_photos.zip"',
+        "Access-Control-Expose-Headers": "Content-Disposition",
+        "Content-Length": str(len(zip_bytes))
+    }
+    return Response(content=zip_bytes, media_type="application/zip", headers=headers)
+
+    pass
+    if False:
         for item in payload.photos:
             try:
                 photo_bytes = _get_photo_bytes(item.drive_file_id)
@@ -882,6 +982,112 @@ def delete_event(event_id: str):
         return {"status": "deleted", "event_id": event_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ── Photographer & Events Database Endpoints ─────────────────────────────────
+
+class RegisterRequest(pydantic.BaseModel):
+    name: str
+    email: str
+    password: str
+
+class LoginRequest(pydantic.BaseModel):
+    email: str
+    password: str
+
+class CreateEventRequest(pydantic.BaseModel):
+    photographer_id: int
+    name: str
+    event_password: Optional[str] = ""
+    drive_link: Optional[str] = ""
+    event_id: Optional[str] = ""
+
+class VerifyEventRequest(pydantic.BaseModel):
+    event_identifier: str
+    event_password: str
+
+@app.post("/events/verify")
+def api_verify_event(payload: VerifyEventRequest):
+    evt = verify_event_access(payload.event_identifier, payload.event_password)
+    if not evt:
+        raise HTTPException(status_code=401, detail="Invalid event name or password.")
+    return {
+        "valid": True,
+        "event_id": evt.event_id,
+        "name": evt.name,
+    }
+
+@app.get("/events/info")
+def api_get_event_info(event_id: str = Query(...)):
+    from database import SessionLocal, Event
+    db = SessionLocal()
+    try:
+        evt = db.query(Event).filter(Event.event_id == event_id.strip()).first()
+        if not evt:
+            return {"event_id": event_id, "name": event_id}
+        return {"event_id": evt.event_id, "name": evt.name}
+    finally:
+        db.close()
+
+@app.post("/auth/register")
+def api_register(payload: RegisterRequest):
+    try:
+        user = register_photographer(payload.name, payload.email, payload.password)
+        return {"id": user.id, "name": user.name, "email": user.email}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Registration failed: {e}")
+
+@app.post("/auth/login")
+def api_login(payload: LoginRequest):
+    user = authenticate_photographer(payload.email, payload.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    return {"id": user.id, "name": user.name, "email": user.email}
+
+@app.post("/db/events")
+def api_create_event(payload: CreateEventRequest):
+    try:
+        folder_id = ""
+        if payload.drive_link:
+            try:
+                folder_id = _parse_drive_folder_id(payload.drive_link)
+            except Exception:
+                folder_id = payload.drive_link
+        evt = create_event_record(
+            photographer_id=payload.photographer_id,
+            name=payload.name,
+            event_password=payload.event_password or "",
+            drive_folder_id=folder_id,
+            event_id=payload.event_id or ""
+        )
+        return {
+            "id": evt.id,
+            "event_id": evt.event_id,
+            "photographer_id": evt.photographer_id,
+            "name": evt.name,
+            "event_password": evt.event_password or "",
+            "drive_folder_id": evt.drive_folder_id,
+            "created_at": evt.created_at.isoformat() if evt.created_at else None,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save event: {e}")
+
+@app.get("/db/events")
+def api_get_events(photographer_id: int = Query(...)):
+    events = get_photographer_events(photographer_id)
+    return [
+        {
+            "id": e.id,
+            "event_id": e.event_id,
+            "photographer_id": e.photographer_id,
+            "name": e.name,
+            "event_password": e.event_password or "",
+            "drive_folder_id": e.drive_folder_id,
+            "created_at": e.created_at.isoformat() if e.created_at else None,
+        }
+        for e in events
+    ]
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
